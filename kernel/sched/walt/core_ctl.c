@@ -992,6 +992,8 @@ static void update_running_avg(u64 window_start, u32 wakeup_ctr_sum)
 	unsigned int index = 0;
 	unsigned long flags;
 	int big_avg = 0;
+	int giant = 0;
+	int cpu;
 
 	nr_stats = sched_get_nr_running_avg();
 
@@ -1040,12 +1042,15 @@ static void update_running_avg(u64 window_start, u32 wakeup_ctr_sum)
 
 		cluster->nr_big = cluster_real_big_tasks(index);
 		big_avg += cluster->nr_big;
+
+		for_each_cpu(cpu, &cluster->cpu_mask)
+			giant += nr_stats[cpu].nr_giant;
 	}
 	spin_unlock_irqrestore(&state_lock, flags);
 
 	last_nr_big = big_avg;
 
-	walt_rotation_checkpoint(big_avg);
+	walt_rotation_checkpoint(window_start, giant);
 	/* Update the SMART freq configuration for NON-IPC reasons. */
 	smart_freq_update_reason_common(window_start, big_avg, wakeup_ctr_sum);
 }
@@ -1148,7 +1153,8 @@ static bool adjustment_possible(const struct cluster_data *cluster,
 						cluster_paused_cpus(cluster)));
 }
 
-static bool eval_need(struct cluster_data *cluster)
+#define GIANT_TASK_OFFLINE_DELAY_NS 300000000
+static bool eval_need(struct cluster_data *cluster, u64 window_start)
 {
 	unsigned long flags;
 	unsigned int need_cpus = 0, last_need;
@@ -1162,7 +1168,10 @@ static bool eval_need(struct cluster_data *cluster)
 
 	spin_lock_irqsave(&state_lock, flags);
 
-	if (cluster->boost || !cluster->enable)
+	if (cluster->boost || !cluster->enable ||
+		(walt_rotation_stop_hyst_start_ts &&
+		 (window_start - walt_rotation_stop_hyst_start_ts <
+		  GIANT_TASK_OFFLINE_DELAY_NS)))
 		need_cpus = cluster->max_cpus;
 	else
 		need_cpus = apply_task_need(cluster);
@@ -1207,7 +1216,9 @@ unlock:
 
 static void sysfs_param_changed(struct cluster_data *cluster)
 {
-	if (eval_need(cluster))
+	u64 now = walt_sched_clock();
+
+	if (eval_need(cluster, now))
 		wake_up_core_ctl_thread();
 }
 
@@ -1506,7 +1517,7 @@ void core_ctl_check(u64 window_start, u32 wakeup_ctr_sum)
 	update_running_avg(window_start, wakeup_ctr_sum);
 
 	for_each_cluster(cluster, index)
-		wakeup |= eval_need(cluster);
+		wakeup |= eval_need(cluster, window_start);
 
 	if (wakeup)
 		do_core_ctl();
