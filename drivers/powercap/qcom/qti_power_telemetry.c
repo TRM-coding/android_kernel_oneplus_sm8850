@@ -102,7 +102,8 @@ static u32 get_data_update_rate_from_config(uint8_t timer_lb, uint8_t timer_ub,
 	u32 timer = timer_ub << 8 | timer_lb;
 	u32 hz = config0 & BIT(3) ? 10 : 32000;
 
-	return (timer * max_count  * 1000 / hz);
+	// return (timer * max_count  * 1000 / hz);
+	return (u32)10;
 }
 
 static u32 get_scaling_factor_from_config(uint8_t config, uint8_t config2)
