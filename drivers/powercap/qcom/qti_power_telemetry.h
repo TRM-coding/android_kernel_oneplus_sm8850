@@ -214,6 +214,8 @@ struct qpt_priv {
 	struct list_head	qpt_dev_head;
 	struct mutex		hw_read_lock;
 	struct notifier_block	genpd_nb;
+	struct hrtimer		polling_timer;
+	bool			polling_enabled;
 };
 
 #endif /* __QCOM_QPT_H__ */

@@ -42,6 +42,9 @@
 static int qpt_update_interval_ms;
 module_param_named(reporting_interval, qpt_update_interval_ms, int, 0444);
 
+static int qpt_polling_interval_ms = 100;
+module_param_named(polling_interval_ms, qpt_polling_interval_ms, int, 0644);
+
 static int qpt_sdam_nvmem_write(struct qpt_priv *qpt, struct qpt_sdam *sdam,
 		uint16_t offset, size_t bytes, void *data)
 {
@@ -102,8 +105,7 @@ static u32 get_data_update_rate_from_config(uint8_t timer_lb, uint8_t timer_ub,
 	u32 timer = timer_ub << 8 | timer_lb;
 	u32 hz = config0 & BIT(3) ? 10 : 32000;
 
-	// return (timer * max_count  * 1000 / hz);
-	return (u32)10;
+	return (timer * max_count  * 1000 / hz);
 }
 
 static u32 get_scaling_factor_from_config(uint8_t config, uint8_t config2)
@@ -177,12 +179,46 @@ static int qti_qpt_sync_common_telemetry_config(struct qpt_priv *qpt)
 	QPT_DBG_EVENT(qpt, "scaling_factor:%d reporting sampling:%d",
 			qpt->adc_scaling_factor, qpt_update_interval_ms);
 
+	/* Override timer for higher sampling rate (100ms instead of 1s) */
+	{
+		uint8_t timer_lb = 32;  /* New timer = 32 for 100ms sampling */
+		uint8_t timer_ub = 0;
+		int override_rc;
+
+		override_rc = qpt_sdam_nvmem_write(qpt, &qpt->sdam[CONFIG_SDAM],
+			QPT_CONFIG_SDAM_BASE_OFF + CONFIG_SDAM_TELEMETRY_TIMER_LB,
+			1, &timer_lb);
+		if (override_rc >= 0) {
+			override_rc = qpt_sdam_nvmem_write(qpt, &qpt->sdam[CONFIG_SDAM],
+				QPT_CONFIG_SDAM_BASE_OFF + CONFIG_SDAM_TELEMETRY_TIMER_UB,
+				1, &timer_ub);
+		}
+
+		if (override_rc >= 0) {
+			/* Recalculate update interval with new timer */
+			qpt_update_interval_ms = get_data_update_rate_from_config(
+				timer_lb, timer_ub,
+				config_sdam[CONFIG_SDAM_TELEMETRY_CONFIG0],
+				config_sdam[CONFIG_SDAM_DATA_READY_MAX_COUNT]);
+			qpt->bob_tperiod = qpt_update_interval_ms / qpt->bob_max_count;
+			qpt->tperiod = get_tperiod_from_config(timer_lb, timer_ub,
+				config_sdam[CONFIG_SDAM_TELEMETRY_CONFIG0],
+				config_sdam[CONFIG_SDAM_TELEMETRY_CONFIG1]);
+
+			QPT_DBG_EVENT(qpt, "Timer overridden: new update interval=%dms, tperiod=%d",
+				qpt_update_interval_ms, qpt->tperiod);
+			dev_info(qpt->dev, "QPT sampling rate increased to 100ms\n");
+		} else {
+			dev_warn(qpt->dev, "Failed to override timer, rc=%d\n", override_rc);
+		}
+	}
+
 unlock_exit:
 	mutex_unlock(&qpt->hw_read_lock);
 
 	return rc >= 0 ? 0 : rc;
 }
-
+  
 static int qti_qpt_start_stop_telemetry(struct qpt_priv *qpt, bool enable)
 {
 	int rc = 0;
@@ -470,6 +506,25 @@ static int qti_qpt_overflow_ack_back_sdam(struct qpt_priv *qpt)
 
 	return qpt_sdam_nvmem_write(qpt, &qpt->sdam[DATA_FRAC_SDAM],
 		DATA_SDAM_TRIG_SET, 1, (void *)&trig_set);
+}
+
+static enum hrtimer_restart qpt_polling_timer_callback(struct hrtimer *timer)
+{
+	struct qpt_priv *qpt = container_of(timer, struct qpt_priv, polling_timer);
+
+	if (!qpt->polling_enabled)
+		return HRTIMER_NORESTART;
+
+	/* Read data periodically */
+	qti_qpt_read_data_update(qpt);
+
+	/* Notify qptf about data update */
+	qptm_power_data_update();
+
+	/* Reschedule the timer */
+	hrtimer_forward_now(timer, ms_to_ktime(qpt_polling_interval_ms));
+
+	return HRTIMER_RESTART;
 }
 
 static irqreturn_t qpt_sdam_irq_handler(int irq, void *data)
@@ -794,6 +849,13 @@ static int qti_qpt_hw_init(struct qpt_priv *qpt)
 	/* Update first reading for all channels */
 	qti_qpt_read_data_update(qpt);
 
+	/* Initialize and start high-frequency polling timer */
+	hrtimer_init(&qpt->polling_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	qpt->polling_timer.function = qpt_polling_timer_callback;
+	qpt->polling_enabled = true;
+	hrtimer_start(&qpt->polling_timer, ms_to_ktime(qpt_polling_interval_ms), HRTIMER_MODE_REL);
+	dev_info(qpt->dev, "Started high-freq polling with interval %d ms\n", qpt_polling_interval_ms);
+
 	return 0;
 }
 
@@ -840,6 +902,13 @@ static void qti_qpt_hw_release(struct qpt_priv *qpt)
 	pm_runtime_disable(qpt->dev);
 	dev_pm_genpd_remove_notifier(qpt->dev);
 	struct qpt_device *qpt_dev, *aux;
+
+	/* Stop polling timer */
+	if (qpt->polling_enabled) {
+		qpt->polling_enabled = false;
+		hrtimer_cancel(&qpt->polling_timer);
+		dev_info(qpt->dev, "Stopped high-freq polling timer\n");
+	}
 
 	qti_qpt_start_stop_telemetry(qpt, false);
 	list_for_each_entry_safe(qpt_dev, aux, &qpt->qpt_dev_head, qpt_node) {
